@@ -1,0 +1,330 @@
+#!/usr/bin/env python
+"""
+
+Run Random Acceleration Molecular Dynamics (RAMD) to drive ligand egress from
+a buried binding site, for systems where ligand-selective boosting (LiGaMD)
+fails to produce dissociation.
+
+Each replica is an independent RAMD trajectory; the distribution of exit times
+over many replicas is the basis of the tau-RAMD residence-time estimate.
+
+"""
+
+import argparse
+import os
+import sys
+import time
+
+import numpy as np
+
+import mdtraj
+import mdtraj.reporters
+
+import openmm
+import openmm.app as openmm_app
+import openmm.unit as unit
+
+import ramd
+
+# Solvent residue names stripped from the trajectory when writing solute-only
+# output. Water positions carry no ligand-egress information.
+WATER_NAMES = {"WAT", "HOH", "H2O", "T3P", "T4P", "SOL", "TIP3"}
+
+# OpenMM's Topology carries no protein flag, so identify the receptor by
+# residue name. Covers the Amber protonation and disulfide variants.
+AMINO_ACIDS = {
+    "ALA", "ARG", "ASN", "ASP", "ASH", "CYS", "CYX", "CYM", "GLN", "GLU",
+    "GLH", "GLY", "HIS", "HID", "HIE", "HIP", "ILE", "LEU", "LYS", "LYN",
+    "MET", "PHE", "PRO", "SER", "THR", "TRP", "TYR", "VAL", "HYP", "SEC",
+}
+
+
+def protein_atom_indices(topology):
+    return [atom.index for atom in topology.atoms()
+            if atom.residue.name.strip().upper() in AMINO_ACIDS]
+
+
+def solute_atom_indices(topology):
+    """Everything except bulk solvent: receptor, ligand, cofactors, ions."""
+    return [atom.index for atom in topology.atoms()
+            if atom.residue.name.strip().upper() not in WATER_NAMES]
+
+
+def write_solute_reference(prmtop_file, inpcrd_file, path):
+    """Write a topology matching the solute-only trajectory.
+
+    A solute-only DCD has a different atom count from the full system, so it
+    cannot be read against the original prmtop; this reference is what the
+    trajectories should be loaded with.
+    """
+    frame = mdtraj.load(inpcrd_file, top=prmtop_file)
+    keep = [a.index for a in frame.topology.atoms
+            if a.residue.name.strip().upper() not in WATER_NAMES]
+    frame.atom_slice(keep).save_pdb(path)
+    return len(keep)
+
+
+def build_simulation(prmtop_file, inpcrd_file, ligand_selection, platform_name,
+                     device_index, temperature, timestep, friction, cutoff):
+    prmtop = openmm_app.AmberPrmtopFile(prmtop_file)
+    inpcrd = openmm_app.AmberInpcrdFile(inpcrd_file)
+
+    system = prmtop.createSystem(
+        nonbondedMethod=openmm_app.PME,
+        nonbondedCutoff=cutoff * unit.nanometer,
+        constraints=openmm_app.HBonds)
+
+    ligand = [a.index for a in prmtop.topology.atoms()
+              if a.residue.name == ligand_selection]
+    if not ligand:
+        raise ValueError("No atoms found for residue name '%s'" % ligand_selection)
+    protein = protein_atom_indices(prmtop.topology)
+    if not protein:
+        raise ValueError("No protein atoms found in topology")
+
+    ramd.add_ramd_force(system, ligand)
+
+    integrator = openmm.LangevinMiddleIntegrator(
+        temperature * unit.kelvin,
+        friction / unit.picosecond,
+        timestep * unit.picoseconds)
+
+    platform = openmm.Platform.getPlatformByName(platform_name)
+    properties = {}
+    if platform_name == "CUDA":
+        properties = {"CudaDeviceIndex": device_index, "CudaPrecision": "mixed"}
+
+    simulation = openmm_app.Simulation(
+        prmtop.topology, system, integrator, platform, properties)
+    simulation.context.setPositions(inpcrd.positions)
+    if inpcrd.boxVectors is not None:
+        simulation.context.setPeriodicBoxVectors(*inpcrd.boxVectors)
+
+    return simulation, ligand, protein
+
+
+def solvent_buffer(prmtop_file, inpcrd_file):
+    """Smallest gap in Angstroms between the solute and the box edge.
+
+    A dissociation criterion larger than this can never be met: the ligand
+    reaches its own periodic image first.
+    """
+    prmtop = openmm_app.AmberPrmtopFile(prmtop_file)
+    inpcrd = openmm_app.AmberInpcrdFile(inpcrd_file)
+    if inpcrd.boxVectors is None:
+        return None
+    box = np.array([v.value_in_unit(unit.angstrom)[i]
+                    for i, v in enumerate(inpcrd.boxVectors)])
+    positions = np.array(
+        inpcrd.positions.value_in_unit(unit.angstrom))
+    solute = protein_atom_indices(prmtop.topology)
+    if not solute:
+        return None
+    extent = positions[solute].max(0) - positions[solute].min(0)
+    return float(((box - extent) / 2.0).min())
+
+
+def main():
+    argparser = argparse.ArgumentParser(description=__doc__)
+    argparser.add_argument("prmtop", metavar="PRMTOP", type=str,
+                           help="Amber topology file.")
+    argparser.add_argument("inpcrd", metavar="INPCRD", type=str,
+                           help="Amber coordinate file.")
+    argparser.add_argument("-l", "--ligand", dest="ligand", required=True,
+                           type=str,
+                           help="Residue name of the ligand, e.g. 'ERY'.")
+    argparser.add_argument("-f", "--force", dest="force", default=16.0,
+                           type=float,
+                           help="RAMD force magnitude in kcal/mol/Angstrom. "
+                                "Default 16.0, following NAMD. Run several "
+                                "magnitudes to confirm the egress route is "
+                                "not an artefact of the applied force.")
+    argparser.add_argument("-n", "--replicas", dest="replicas", default=1,
+                           type=int,
+                           help="Number of independent RAMD replicas.")
+    argparser.add_argument("-m", "--max-steps", dest="max_steps",
+                           default=2500000, type=int,
+                           help="Step ceiling per replica (default 5 ns).")
+    argparser.add_argument("--ramd-steps", dest="ramd_steps", default=50,
+                           type=int,
+                           help="Steps per RAMD block between evaluations.")
+    argparser.add_argument("--r-min", dest="r_min", default=0.01, type=float,
+                           help="Minimum COM displacement per block, in "
+                                "Angstroms, below which the force direction "
+                                "is redrawn. Default 0.01.")
+    argparser.add_argument("-d", "--dissociation", dest="dissociation",
+                           default=8.0, type=float,
+                           help="Ligand-protein separation in Angstroms at "
+                                "which the ligand is counted as dissociated. "
+                                "Must be smaller than the solvent buffer, or "
+                                "the ligand meets its own periodic image "
+                                "before the criterion can ever be satisfied.")
+    argparser.add_argument("-p", "--platform", dest="platform", default="CUDA",
+                           type=str, help="OpenMM platform.")
+    argparser.add_argument("--device-index", dest="device_index", default="0",
+                           type=str, help="CUDA device index.")
+    argparser.add_argument("-o", "--output", dest="output", default="ramd_out",
+                           type=str, help="Output directory.")
+    argparser.add_argument("--no-minimize", dest="minimize", default=True,
+                           action="store_false",
+                           help="Skip energy minimisation. Minimisation is on "
+                                "by default: applying the RAMD force to an "
+                                "unrelaxed structure destabilises the system.")
+    argparser.add_argument("--minimize-steps", dest="minimize_steps",
+                           default=5000, type=int,
+                           help="Cap on minimisation iterations. Unbounded "
+                                "minimisation of a solvated system can take "
+                                "longer than the RAMD trajectory itself.")
+    argparser.add_argument("--equilibrate", dest="equilibrate", default=0,
+                           type=int,
+                           help="Unbiased equilibration steps before RAMD.")
+    argparser.add_argument("--seed", dest="seed", default=None, type=int,
+                           help="Base random seed.")
+    argparser.add_argument("--temperature", dest="temperature", default=300.0,
+                           type=float, help="Temperature in kelvin.")
+    argparser.add_argument("--timestep", dest="timestep", default=0.002,
+                           type=float, help="Timestep in picoseconds.")
+    argparser.add_argument("--friction", dest="friction", default=1.0,
+                           type=float,
+                           help="Langevin friction in inverse picoseconds.")
+    argparser.add_argument("--cutoff", dest="cutoff", default=0.8, type=float,
+                           help="Nonbonded cutoff in nanometers.")
+    argparser.add_argument("--full-system", dest="solute_only",
+                           default=True, action="store_false",
+                           help="Write every atom to the trajectory, water "
+                                "included. By default only solute atoms are "
+                                "written, which is far smaller and loses "
+                                "nothing for egress analysis; load those "
+                                "trajectories against solute_reference.pdb.")
+    argparser.add_argument("--trajectory-interval", dest="traj_interval",
+                           default=500, type=int,
+                           help="Steps between trajectory frames. Egress is "
+                                "fast under RAMD, so this is much finer than "
+                                "a conventional production run.")
+
+    args = argparser.parse_args()
+
+    os.makedirs(args.output, exist_ok=True)
+
+    force_kj = args.force * ramd.KCAL_PER_MOL_ANGSTROM
+    summary_path = os.path.join(args.output, "ramd_summary.txt")
+
+    print("RAMD: ligand '%s', force %.1f kcal/mol/A (%.1f kJ/mol/nm), "
+          "%d replica(s)" % (args.ligand, args.force, force_kj, args.replicas))
+
+    buffer_width = solvent_buffer(args.prmtop, args.inpcrd)
+    if buffer_width is not None:
+        print("solvent buffer %.1f A, dissociation criterion %.1f A"
+              % (buffer_width, args.dissociation))
+        if args.dissociation >= buffer_width:
+            raise SystemExit(
+                "Dissociation criterion (%.1f A) is not smaller than the "
+                "solvent buffer (%.1f A): the ligand would reach its own "
+                "periodic image before the criterion could be met. Lower "
+                "-d, or resolvate the system with a larger box."
+                % (args.dissociation, buffer_width))
+    solute_indices = None
+    if args.solute_only:
+        reference = os.path.join(args.output, "solute_reference.pdb")
+        prmtop = openmm_app.AmberPrmtopFile(args.prmtop)
+        solute_indices = solute_atom_indices(prmtop.topology)
+        n_solute = write_solute_reference(args.prmtop, args.inpcrd, reference)
+        print("solute-only trajectories: %d of %d atoms retained, "
+              "load against %s"
+              % (n_solute, prmtop.topology.getNumAtoms(), reference))
+        if n_solute != len(solute_indices):
+            raise SystemExit(
+                "Solute selection disagrees between the reporter (%d atoms) "
+                "and the reference topology (%d atoms); the trajectory would "
+                "not match the reference."
+                % (len(solute_indices), n_solute))
+    sys.stdout.flush()
+
+    results = []
+    for replica in range(1, args.replicas + 1):
+        seed = None if args.seed is None else args.seed + replica
+        simulation, ligand, protein = build_simulation(
+            args.prmtop, args.inpcrd, args.ligand, args.platform,
+            args.device_index, args.temperature, args.timestep,
+            args.friction, args.cutoff)
+
+        if args.minimize:
+            simulation.minimizeEnergy(maxIterations=args.minimize_steps)
+        simulation.context.setVelocitiesToTemperature(
+            args.temperature * unit.kelvin, seed if seed is not None else 0)
+        if args.equilibrate:
+            # Force is still zero here, so this block is unbiased.
+            simulation.step(args.equilibrate)
+
+        traj_name = os.path.join(args.output, "replica%d.dcd" % replica)
+        if args.solute_only:
+            # Load these against solute_reference.pdb, not the prmtop.
+            simulation.reporters.append(mdtraj.reporters.DCDReporter(
+                traj_name, args.traj_interval, atomSubset=solute_indices))
+        else:
+            simulation.reporters.append(
+                openmm_app.DCDReporter(traj_name, args.traj_interval))
+
+        driver = ramd.RAMDSimulation(
+            simulation, ligand, protein,
+            force_magnitude=force_kj,
+            ramd_steps=args.ramd_steps,
+            r_min=args.r_min / 10.0,             # Angstrom -> nm
+            dissociation_distance=args.dissociation / 10.0,
+            seed=seed)
+
+        started = time.time()
+        result = driver.run(args.max_steps)
+        elapsed = time.time() - started
+
+        if result["dissociated"]:
+            exit_ns = result["exit_step"] * args.timestep / 1000.0
+            print("replica %d: EGRESS at %.3f ns (%d steps), "
+                  "%d direction changes, %.0f s wall"
+                  % (replica, exit_ns, result["exit_step"],
+                     result["direction_changes"], elapsed))
+        else:
+            exit_ns = None
+            print("replica %d: no egress within %d steps (%.3f ns), "
+                  "%d direction changes, %.0f s wall"
+                  % (replica, args.max_steps,
+                     args.max_steps * args.timestep / 1000.0,
+                     result["direction_changes"], elapsed))
+        sys.stdout.flush()
+
+        result["replica"] = replica
+        result["exit_ns"] = exit_ns
+        results.append(result)
+
+        del simulation
+
+    exit_times = [r["exit_ns"] for r in results if r["dissociated"]]
+    with open(summary_path, "w") as summary:
+        summary.write("# RAMD summary\n")
+        summary.write("# ligand %s, force %.2f kcal/mol/A, "
+                      "dissociation %.1f A\n"
+                      % (args.ligand, args.force, args.dissociation))
+        summary.write("# replica\tdissociated\texit_ns\tdirection_changes\n")
+        for r in results:
+            summary.write("%d\t%s\t%s\t%d\n"
+                          % (r["replica"], r["dissociated"],
+                             "%.4f" % r["exit_ns"] if r["exit_ns"] is not None
+                             else "NA",
+                             r["direction_changes"]))
+        if exit_times:
+            summary.write("# egress %d/%d, mean %.3f ns, median %.3f ns\n"
+                          % (len(exit_times), len(results),
+                             float(np.mean(exit_times)),
+                             float(np.median(exit_times))))
+
+    if exit_times:
+        print("egress in %d/%d replicas; mean %.3f ns, median %.3f ns"
+              % (len(exit_times), len(results),
+                 float(np.mean(exit_times)), float(np.median(exit_times))))
+    else:
+        print("no egress in any replica")
+    print("summary written to %s" % summary_path)
+
+
+if __name__ == "__main__":
+    main()
